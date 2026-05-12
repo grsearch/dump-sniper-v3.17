@@ -1,8 +1,10 @@
-# Dump Sniper V3.17
+# Dump Sniper V3.17.6
 
-Solana memecoin dump-rebound sniper. Listens for large sell orders with high price impact, executes counter-trade buys via **direct Pump.fun AMM SDK** (no Jupiter), exits on rebound (with trailing stop) or timeout.
+Solana memecoin dump-rebound sniper. Listens for large sell orders with high price impact, executes counter-trade buys via **direct Pump.fun AMM SDK** (no Jupiter), exits on rebound (with trailing stop + stabilization period) or timeout.
 
-> **v3.17 关键变化**：止盈策略从 "+8% 双确认" 改为 "+50% 双确认 + 移动止盈"；持仓时间从 15s 拉到 30min；新增多 region LaserStream 订阅 + 多 region Sender 并发提交。详见 `UPGRADE_v3.17.md` 和 `DEPLOY.md`。
+> **v3.17.6 关键变化**:实战 6 个 bug 修复 — reconcile 后 HWM 重置、stabilization 期过滤瞬态价、同砸单跨region去重(持久化)、SELL 链上 reconcile、trailing 参数优化、CU limit 降到 170K。详见 `UPGRADE_v3.17.6.md`。
+>
+> **v3.17 关键变化**:止盈策略 +50% TP + 移动止盈,持仓 30min,多region LaserStream/Sender。
 >
 > **v3 vs v2**: Switched from Jupiter V6 to direct Pump.fun AMM SDK — saves 100-200ms per trade.
 
@@ -22,16 +24,19 @@ Solana memecoin dump-rebound sniper. Listens for large sell orders with high pri
 
 ---
 
-## Strategy (v3.17)
+## Strategy (v3.17.6)
 
 When a wallet dumps ≥ 15 SOL of a watched token causing 12-30% single-tx price impact (and pool has ≥ 30 SOL liquidity):
 
 1. **Buy** via Pump AMM SDK within 1-2 slots (~400-800ms after the dump tx), with Jito tip via multi-region Helius Sender
-2. Wait for rebound, exit via the **first** of these to trigger:
-   - **+50% rebound** (with double-confirmation): main take-profit
-   - **+5% peak then 2% drawdown** (trailing stop): lock smaller wins, the more common case
-   - **-15% drawdown from entry** (emergency stop): cut losses immediately
-   - **30 min timeout**: forced exit at market
+2. **Reconcile**: 1 秒内 fetchTxSwapResult 拉链上真实 entrySol/entryPrice/tokenAmount(替代 SDK 估算)
+3. **Stabilization**(5秒):收集池子价格样本,取中位数作为 trailing HWM 起点 — 过滤砸盘后剧烈波动 + 自买入推高池子价格的瞬态值。期间只允许 emergency_stop 工作。
+4. Stabilization 结束后,exit 由这几条规则按优先级触发:
+   - **+50% rebound**(双确认):main take-profit
+   - **+8% peak then 3% drawdown**(trailing stop):锁中等反弹利润(实战主要止盈来源)
+   - **-15% drawdown from entry**(emergency stop):救命路径,任何时候都工作
+   - **30 min timeout**:兜底强制平仓
+5. **SELL** 落链确认后用 `fetchTxSwapResult` 拉链上真实 exitSol,准确计算 PnL。
 
 All thresholds are configurable in `.env`. See `.env.example` for full reference.
 

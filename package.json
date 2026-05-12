@@ -1,7 +1,7 @@
 {
   "name": "dump-sniper",
-  "version": "3.17.0",
-  "description": "Solana Pump.fun dump-rebound sniper. Detects large sell orders with high price impact, executes counter-trade buys via direct Pump AMM SDK, exits on rebound (with trailing stop) or timeout.",
+  "version": "3.17.6",
+  "description": "Solana Pump.fun dump-rebound sniper. v3.17.6: trailing stop with stabilization, multi-region LaserStream/Sender, full BUY+SELL on-chain reconcile.",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",

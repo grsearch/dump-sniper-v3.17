@@ -96,7 +96,12 @@ class Executor {
     }
 
     this.maxPriorityFeeLamports = config.maxPriorityFeeLamports;
-    this.computeUnitLimit = parseInt(process.env.COMPUTE_UNIT_LIMIT || '200000', 10);
+    // v3.17.6: CU limit 默认从 200K 降到 170K
+    //   原因：实测 BUY 实际消耗 135-146K CU，200K 余量 25% 浪费了
+    //   μL/CU 排序：fee/CU，CU 越大单价越低 → 同 slot 排序越靠后
+    //   170K = 146K + 17% 余量，给 HERMES 这种带 fee_program CPI 的 swap 留够
+    //   监控：cuNearLimit 计数器（≥90% 利用率告警），如有触发应立刻调回 200K
+    this.computeUnitLimit = parseInt(process.env.COMPUTE_UNIT_LIMIT || '170000', 10);
 
     // v3.5: 通过 setPoolStateCache 由外部注入（避免循环依赖 TokenRegistry）
     this.poolStateCache = null;

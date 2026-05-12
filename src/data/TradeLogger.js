@@ -208,7 +208,22 @@ class TradeLogger {
       getPositionsInRange: this.db.prepare(
         `SELECT * FROM positions WHERE opened_at >= ? AND opened_at < ? ORDER BY opened_at ASC`,
       ),
+      // v3.17.6: 启动时恢复"已触发过买入"的 seller_tx，防 LaserStream 重新推同砸单导致二次触发
+      getRecentAcceptedSellerTxs: this.db.prepare(
+        `SELECT seller_tx, ts FROM signals
+         WHERE accepted = 1 AND seller_tx IS NOT NULL AND ts >= ?
+         ORDER BY ts ASC`,
+      ),
     };
+  }
+
+  /**
+   * v3.17.6: 返回最近 sinceMs 毫秒内 accepted=1 的 seller_tx 列表
+   * 用于 SignalEngine 启动时恢复内存 dedup 缓存
+   */
+  getRecentAcceptedSellerTxs(sinceMs) {
+    const since = Date.now() - sinceMs;
+    return this.stmts.getRecentAcceptedSellerTxs.all(since);
   }
 
   logSignal(sig) {

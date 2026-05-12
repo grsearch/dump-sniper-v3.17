@@ -20,30 +20,50 @@ const config = {
     // 仓位
     positionSizeSol: parseFloat(process.env.POSITION_SIZE_SOL || '0.1'),
 
-    // v3.17 止盈策略改造：
-    //   1) 主止盈 TAKE_PROFIT_PCT 从 +8% 拉到 +50%（捕捉真正的大反弹），保留双确认
-    //   2) 新增移动止盈 TRAILING_*：当 highWaterMark 涨过 +trailingActivatePct（默认 +5%）后
-    //      armed，价格相对 highWaterMark 回撤 trailingDrawdownPct（默认 2%）立即卖
-    //   3) 紧急止损保留 -15%
-    //   4) MAX_HOLD_MS 从 15s 拉到 30min（1800000ms），给反弹更长时间
+    // v3.17 止盈策略改造，v3.17.6 实战调参：
+    //   1) 主止盈 TAKE_PROFIT_PCT +50%（保留双确认）— 捕捉大反弹
+    //   2) 移动止盈 TRAILING_* — 锁中等反弹利润（实战主要止盈来源）
+    //      v3.17.6 调参：从 5%/2% 拉到 8%/3%
+    //      - 实战发现 AMM 自买入会推高池子价格 5-10%（我们 3 SOL 进 30 SOL 池子约 +10%）
+    //      - 这导致 5% activate 太敏感，会被自买入虚高触发
+    //      - 但这个问题在 v3.17.6 用 stabilization 期 + 中位数 baseline 已根治
+    //      - 所以 8% 是"双保险"：stabilization 过滤瞬态高价 + 8% 阈值再过滤一道
+    //      - openclaw 拍脑袋拉到 15%/5% 过于保守，会错过大部分中等反弹
+    //   3) 紧急止损 -15% 不变
+    //   4) MAX_HOLD_MS 30min 不变
     takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || '50.0'),
     tpConfirmCount: parseInt(process.env.TP_CONFIRM_COUNT || '2', 10),
     tpConfirmMinGapMs: parseInt(process.env.TP_CONFIRM_MIN_GAP_MS || '300', 10),
 
-    // 移动止盈
-    //   trailingActivatePct: highWaterMark 要涨过 entryPrice × (1 + 此值/100) 才 arm
-    //   trailingDrawdownPct: armed 后，价格从 highWaterMark 回撤此 % 立即 SELL
-    //   trailingMinHwmAgeMs: highWaterMark 必须稳定至少此毫秒数（防单 tick 污染创虚假高点）
+    // 移动止盈（v3.17.6 调参）
+    //   trailingActivatePct: HWM 涨过 entryPrice × (1 + 此值/100) 才 arm
+    //   trailingDrawdownPct: armed 后，价格从 HWM 回撤此 % 立即 SELL
+    //   trailingMinHwmAgeMs: HWM 必须稳定至少此毫秒数（防单 tick 污染）
     //   设 trailingActivatePct=0 或 trailingDrawdownPct=0 可禁用移动止盈
-    trailingActivatePct: parseFloat(process.env.TRAILING_ACTIVATE_PCT || '5.0'),
-    trailingDrawdownPct: parseFloat(process.env.TRAILING_DRAWDOWN_PCT || '2.0'),
-    trailingMinHwmAgeMs: parseInt(process.env.TRAILING_MIN_HWM_AGE_MS || '100', 10),
+    trailingActivatePct: parseFloat(process.env.TRAILING_ACTIVATE_PCT || '8.0'),
+    trailingDrawdownPct: parseFloat(process.env.TRAILING_DRAWDOWN_PCT || '3.0'),
+    trailingMinHwmAgeMs: parseInt(process.env.TRAILING_MIN_HWM_AGE_MS || '2000', 10),
 
-    // 紧急止损（防止灾难性下跌，比如 -97% 那种）
+    // v3.17.6: Stabilization 期 —— reconcile 完成后等价格稳定，再开始 trailing 追踪
+    //   原理：砸盘后 + 我们自买入 → 池子价格剧烈波动 + 虚高 5-10%
+    //         如果 reconcile 完成立刻开始追 HWM，第一个 tick 就是虚高瞬态值
+    //         → trailing 立刻 armed → 真实价格回归被误判"回撤" → 误杀
+    //   修复：reconcile 完成后进入 stabilization 期（默认 5 秒）：
+    //         - 收集所有 priceTick 进 buffer
+    //         - 不更新 HWM，不武装 trailing，不检查 TP
+    //         - emergency_stop 仍正常工作（救命路径不能屏蔽）
+    //         期满取样本中位数作为 HWM 起点，过滤自买入推高和砸盘瞬态
+    //   实战权衡：
+    //     - 5 秒：覆盖砸盘后短暂剧烈波动（实测多数 < 3 秒就稳定）
+    //     - 太短（< 3s）：保护不够，自买入虚高没消化完
+    //     - 太长（> 10s）：错过早期快速反弹的入场窗口
+    stabilizationMs: parseInt(process.env.STABILIZATION_MS || '5000', 10),
+
+    // 紧急止损（防止灾难性下跌）
     // 设置为 0 可禁用紧急止损（恢复"硬扛"行为）
     emergencyStopLossPct: parseFloat(process.env.EMERGENCY_STOP_LOSS_PCT || '-15.0'),
 
-    // 持仓上限时间（v3.17 默认改 30min = 1800000ms）
+    // 持仓上限时间（v3.17 默认 30min = 1800000ms）
     maxHoldMs: parseInt(process.env.MAX_HOLD_MS || '1800000', 10),
 
     // 滑点
@@ -53,6 +73,12 @@ const config = {
     // 风控（v3.17 默认 maxConcurrent 5）
     cooldownMsPerToken: parseInt(process.env.COOLDOWN_MS_PER_TOKEN || '60000', 10),
     maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '5', 10),
+
+    // v3.17.6: 同砸单去重时间窗（毫秒）
+    //   防 LaserStream 多 region 跨越 dedup TTL 后重推同一砸单导致二次触发
+    //   实战案例：同一 seller_tx 在 2 分钟后被慢 region 重新推送 → 价格已跌 20% → 亏
+    //   10 分钟覆盖最慢 region + 重启窗口，且通过 signals 表持久化（启动时恢复）
+    sellerTxDedupMs: parseInt(process.env.SELLER_TX_DEDUP_MS || '600000', 10),
   },
 
   // ============ Price anomaly filter ============

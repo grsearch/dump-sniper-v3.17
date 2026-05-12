@@ -117,7 +117,7 @@ BIRDEYE_API_KEY=<你的 Birdeye API key>
 WALLET_PRIVATE_KEY_BS58=<钱包私钥 base58>
 ```
 
-### v3.17 关键策略参数(已是新默认值,确认即可)
+### v3.17.6 关键策略参数(已是新默认值,确认即可)
 
 ```bash
 # 触发条件
@@ -129,15 +129,18 @@ MIN_POOL_QUOTE_SOL=30.0
 # 仓位 — 先小金额!验证策略可用后再放大
 POSITION_SIZE_SOL=0.1
 
-# 止盈策略(v3.17)
+# 止盈策略(v3.17.6 实战调参)
 TAKE_PROFIT_PCT=50.0
 TP_CONFIRM_COUNT=2
 TP_CONFIRM_MIN_GAP_MS=300
 
-# 移动止盈(v3.17 新增)
-TRAILING_ACTIVATE_PCT=5.0
-TRAILING_DRAWDOWN_PCT=2.0
-TRAILING_MIN_HWM_AGE_MS=100
+# 移动止盈(v3.17.6 调参 8/3/2000)
+TRAILING_ACTIVATE_PCT=8.0
+TRAILING_DRAWDOWN_PCT=3.0
+TRAILING_MIN_HWM_AGE_MS=2000
+
+# Stabilization 期(v3.17.6 新增 — 关键!)
+STABILIZATION_MS=5000
 
 # 紧急止损
 EMERGENCY_STOP_LOSS_PCT=-15.0
@@ -152,6 +155,12 @@ SELL_SLIPPAGE_BPS=2000
 # 风控
 COOLDOWN_MS_PER_TOKEN=60000
 MAX_CONCURRENT_POSITIONS=5
+
+# v3.17.6 同砸单去重(防 LaserStream 跨region重推同砸单)
+SELLER_TX_DEDUP_MS=600000
+
+# CU 限制(v3.17.6 降到 170K 提升 μL/CU 排名)
+COMPUTE_UNIT_LIMIT=170000
 ```
 
 ### v3.17 延迟优化:多 region 配置(强烈推荐)
@@ -237,9 +246,19 @@ sudo journalctl -u dump-sniper -f
 [TickStream:FRA] connected, watching N mints
 [TickStream:EWR] connected, watching N mints
 [TickStream:TYO] connected, watching N mints
+[SignalEngine] restored N triggered seller_tx from DB (within last 10min, dedup window)   ← v3.17.6 新增
 ```
 
-看到 3 个 `connected` 说明多 region 订阅都建立了。
+策略触发时(关键日志):
+```
+[SignalEngine] ✅ BUY_SIGNAL ... seller_tx=xxx..
+[Executor] Sender race won by FRA in ZZms ...
+[PositionManager] 📈 OPEN ...
+[PositionManager] 🔧 BUY reconciled XXX: entrySol 3.0→2.87 (-4.3%), ...
+[PositionManager] ✅ stabilization done XXX: samples=8, baseline=1.05e-6 (+4.20%), HWM set to ...  ← v3.17.6
+```
+
+看到 3 个 `connected` + `restored ... seller_tx` + `stabilization done` 说明多 region + dedup 持久化 + 稳定期都工作了。
 
 ---
 

@@ -130,10 +130,14 @@ class PositionManager extends EventEmitter {
         // v3.17: trailing 字段（DB 未持久化，重启后保守地从 entryPrice 重新追踪）
         //   缺点：如果重启时价格已经远高于 entryPrice，trailing 会"重置" highWaterMark
         //         相当于重启后让出一次本可以触发的 trailing。这是为了简化 DB schema 而做的取舍。
-        //   下次有 priceTick 时如果当前价 > entryPrice，highWaterMark 会立刻被刷新到当前价。
         highWaterMark: row.entry_price,
         highWaterMarkTs: Date.now(),
         trailingArmed: false,
+        // v3.17.6: 重启时也进入 stabilization 期
+        //   避免重启后第一个 tick 拿到的剧烈波动价格污染 HWM
+        stabilizing: true,
+        reconciledAt: Date.now(),
+        _stabilizeSamples: [],
         // 恢复时已经 reconciled（DB 里的 entryPrice 已经是真实成交价）
         reconciled: true,
       };
@@ -190,13 +194,15 @@ class PositionManager extends EventEmitter {
       // DRY_RUN 不走 reconcile，直接标 true
       reconciled: !!dryRun,
       // v3.17: 移动止盈追踪
-      //   highWaterMark: 持有期内最高观察价格（初始 = entryPrice）
-      //   highWaterMarkTs: highWaterMark 被设置的时间（用于稳定性过滤）
-      //   trailingArmed: 是否已经触发 "highWaterMark 涨过 +trailingActivatePct" 条件
-      //                  一旦置 true 就不再回退（即使价格回落 trailing 仍然激活）
       highWaterMark: entryPrice,
       highWaterMarkTs: Date.now(),
       trailingArmed: false,
+      // v3.17.6: stabilization 期
+      //   DRY_RUN：开仓即进入 stabilization(用估算价格作起点)
+      //   LIVE：reconcile 完成时进入 stabilization
+      stabilizing: !!dryRun,
+      reconciledAt: dryRun ? Date.now() : null,
+      _stabilizeSamples: dryRun ? [] : null,
     };
     this.positions.set(pid, pos);
     this.byMint.set(mint, pid);
@@ -349,8 +355,36 @@ class PositionManager extends EventEmitter {
     // realSolSpent 已含 priority fee 与 base fee；为避免双重扣减，把 buyFeeLamports 清零
     pos.buyFeeLamports = 0;
 
-    // v3.12: 标记 reconciled，解除 _checkExit 的临时锁定（开始允许 exit 触发）
-    // 此时 entryPrice 是真实成交价，PnL% 计算才准确
+    // v3.17.6 关键修复（基于实战数据三个 bug 的根治方案）：
+    //
+    // Bug #1 修复：OPEN 时 highWaterMark = 估算 entryPrice（高估 5-15%）
+    //              reconcile 后真实 entryPrice 更低 → 旧 HWM 变成"虚假高点"
+    //              → 紧接着的真实价格被误判为"从 peak 大幅回撤" → trailing 误杀
+    //              修复：reconcile 完成时重置 HWM 到真实 entryPrice
+    //
+    // Bug #3 修复：reconcile 完成那一刻，砸盘后价格还在剧烈波动 + 我们自买入
+    //              推高了 AMM 池子价格 5-10%。第一个 priceTick 拿到的就是这个
+    //              虚高瞬态值 → trailing 立刻 armed → 真实价格回归被误判为
+    //              "回撤" → trailing 误杀
+    //              修复：进入 stabilization 期（默认 5 秒），期间：
+    //                - 不更新 highWaterMark（让 _checkExit 跳过 trailing 流程）
+    //                - 收集所有 priceTick 到 _stabilizeSamples
+    //                - emergency_stop 正常工作（救命路径不能屏蔽）
+    //              stabilization 期结束时，取中位数作为 stabilizedBaseline，
+    //              作为 trailing 的新起点。
+    pos.highWaterMark = pos.entryPrice;
+    pos.highWaterMarkTs = Date.now();
+    pos.trailingArmed = false;
+    pos._tpConfirmCount = 0;
+    pos._tpFirstTriggerTs = null;
+
+    // 进入 stabilization 期
+    pos.reconciledAt = Date.now();
+    pos.stabilizing = true;
+    pos._stabilizeSamples = []; // 期间收到的所有价格
+
+    // v3.12: 标记 reconciled，解除 _checkExit 的"完全跳过"锁定
+    //        进入 stabilization 模式（_checkExit 内部判断 stabilizing 时只跑 emergency）
     pos.reconciled = true;
 
     // 同步到 DB
@@ -404,32 +438,67 @@ class PositionManager extends EventEmitter {
     const pos = this.positions.get(positionId);
     if (!pos || pos.exiting) return;
 
-    // v3.12 关键修复：reconcile 完成前不允许触发任何 exit
-    // 在 BUY 链上确认 + 真实 entrySol 回写之前，pos.entryPrice 是基于 sizeSol 估算
-    // 实测偏差 5-15%，会让 PnL% 假象 -15% 触发误 EMERGENCY_STOP
-    // 或假象 +8% 触发误 TAKE_PROFIT
-    //
-    // 设计：reconcile 完成时设置 pos.reconciled=true；之前的 ticks 全部跳过
-    // 例外：MAX_HOLD_MS 超时（_tick 那条路径）— 因为 30min 超时永远是事实
+    // v3.12: reconcile 完成前完全跳过（entryPrice 是估算值，所有 exit 检查都不可靠）
+    //        例外：MAX_HOLD_MS 超时由 _tick 那条路径触发
     if (!pos.reconciled && !pos.dryRun) {
-      return; // 等 reconcile（约 1 秒）
+      return;
     }
 
     const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
 
-    // ============ 1. 紧急止损：救命路径，不双确认 ============
+    // ============ 1. 紧急止损：救命路径，不双确认，stabilization 期也工作 ============
+    // emergency_stop 在任何阶段都是兜底，即使在 stabilization 期内也要响应
     const emergencyPct = config.strategy.emergencyStopLossPct;
     if (emergencyPct < 0 && pnlPct <= emergencyPct) {
       console.warn(
         `[PositionManager] 🚨 EMERGENCY_STOP ${pos.symbol || pos.mint.slice(0, 6)} ` +
-          `pnl=${pnlPct.toFixed(2)}%`,
+          `pnl=${pnlPct.toFixed(2)}%${pos.stabilizing ? ' (during stabilization)' : ''}`,
       );
       this._exit(pos, price, 'EMERGENCY_STOP');
       return;
     }
 
-    // ============ 2. 更新 highWaterMark ============
-    // 价格创新高 → 刷新 highWaterMark（保留 ts 用于稳定性过滤）
+    // ============ v3.17.6 stabilization 期处理 ============
+    // 期间只收集价格样本，不更新 HWM，不武装 trailing，不检查 TP
+    // 期满时取样本中位数作为 stabilizedBaseline，过滤砸盘瞬态 + 自买入推高
+    if (pos.stabilizing) {
+      pos._stabilizeSamples.push(price);
+
+      const elapsed = Date.now() - pos.reconciledAt;
+      const stabilizeMs = config.strategy.stabilizationMs;
+      if (elapsed >= stabilizeMs) {
+        // stabilization 结束 — 计算中位数 baseline
+        const samples = pos._stabilizeSamples.slice().sort((a, b) => a - b);
+        let baseline;
+        if (samples.length === 0) {
+          baseline = pos.entryPrice; // 期内没收到任何 tick（罕见）
+        } else {
+          const mid = Math.floor(samples.length / 2);
+          baseline = samples.length % 2 === 0
+            ? (samples[mid - 1] + samples[mid]) / 2
+            : samples[mid];
+        }
+        // HWM 取 baseline 和 entryPrice 的较大值（保守：避免 baseline 比 entry 低
+        // 导致后续小幅上涨就立刻 trailing armed）
+        pos.highWaterMark = Math.max(baseline, pos.entryPrice);
+        pos.highWaterMarkTs = Date.now();
+        pos.stabilizing = false;
+        pos._stabilizeSamples = null; // 释放内存
+
+        const baselinePnlPct = ((baseline - pos.entryPrice) / pos.entryPrice) * 100;
+        console.log(
+          `[PositionManager] ✅ stabilization done ${pos.symbol || pos.mint.slice(0, 6)}: ` +
+            `samples=${samples.length}, baseline=${baseline.toExponential(4)} (${baselinePnlPct.toFixed(2)}%), ` +
+            `HWM set to ${pos.highWaterMark.toExponential(4)}`,
+        );
+        monitor.inc('PositionManager.stabilizationDone', 1, 'PositionManager');
+        monitor.set('PositionManager.lastStabilizeSamples', samples.length, 'PositionManager');
+      }
+      // stabilizing 期内不进入 TP / trailing 流程，直接 return
+      return;
+    }
+
+    // ============ 2. 更新 highWaterMark（仅 stabilization 结束后） ============
     if (price > pos.highWaterMark) {
       pos.highWaterMark = price;
       pos.highWaterMarkTs = Date.now();
@@ -632,9 +701,15 @@ class PositionManager extends EventEmitter {
   /**
    * 异步等待 sell tx 落链确认。
    * 三种结果：
-   *   1. 链上确认无 err  → finalizeSuccess
+   *   1. 链上确认无 err  → fetchTxSwapResult 拉真实 solOut → finalizeSuccess
    *   2. 链上 tx 报错      → scheduleRetry
    *   3. 超时未找到 tx    → scheduleRetry（mempool 丢弃）
+   *
+   * v3.17.6 修复：SELL 也用链上真实值替代 SDK 估算
+   *   - 之前 exitPrice/solOut 是 _attemptSell 里 SDK 报价的 expectedSolOut
+   *   - SDK 估算可能偏低 3-10%（不含 priority fee 扣减、池子状态略滞后）
+   *   - 实测：DB 记录 -0.012 SOL 亏损，链上真实 +0.091 SOL 盈利
+   *   - 修复：落链确认后，调 fetchTxSwapResult 拿真实 realSolDelta，覆盖 SDK 估算
    */
   async _confirmSellAsync(pos, signature, exitPrice, solOut, triggerPrice) {
     const result = await this.executor.confirmTx(signature, { timeoutMs: 15_000 });
@@ -643,7 +718,40 @@ class PositionManager extends EventEmitter {
 
     if (result.confirmed) {
       monitor.inc('PositionManager.sellConfirmed', 1, 'PositionManager');
-      this._finalizeSuccess(pos, exitPrice, solOut, signature);
+
+      // v3.17.6: 拉链上真实 SOL 增量
+      let realExitPrice = exitPrice;
+      let realSolOut = solOut;
+      try {
+        const swap = await this.executor.fetchTxSwapResult(signature, pos.mint);
+        // SELL 的 realSolDelta 是正数（钱包 SOL 增加）
+        if (swap && swap.realSolDelta > 0 && pos.tokenAmount > 0) {
+          realSolOut = swap.realSolDelta;
+          realExitPrice = realSolOut / pos.tokenAmount;
+          monitor.inc('PositionManager.sellReconciled', 1, 'PositionManager');
+          const drift = solOut ? ((realSolOut - solOut) / solOut) * 100 : 0;
+          console.log(
+            `[PositionManager] 🔧 SELL reconciled ${pos.symbol || pos.mint.slice(0, 6)}: ` +
+              `SDK est ${(solOut ?? 0).toFixed(4)} → real ${realSolOut.toFixed(4)} SOL (${drift.toFixed(2)}%)`,
+          );
+        } else {
+          // fetchTxSwapResult 失败：保留 SDK 估算（旧行为）
+          monitor.inc('PositionManager.sellReconcileFallback', 1, 'PositionManager');
+          console.warn(
+            `[PositionManager] SELL reconcile fallback to SDK estimate: ${pos.symbol || pos.mint.slice(0, 6)} ` +
+              `sig=${signature.slice(0, 8)}.. (fetch returned no realSolDelta)`,
+          );
+        }
+      } catch (err) {
+        monitor.recordError('PositionManager', err, {
+          phase: 'sell_reconcile_fetch',
+          mint: pos.mint,
+          signature,
+        });
+        // 异常时也 fallback 到 SDK 估算
+      }
+
+      this._finalizeSuccess(pos, realExitPrice, realSolOut, signature);
       return;
     }
 
