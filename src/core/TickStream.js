@@ -154,6 +154,22 @@ class RegionStream {
         this.token,
         { 'grpc.max_receive_message_length': 64 * 1024 * 1024 },
       );
+
+      // v3.17.10: napi-rs 路径(v5.0+ SDK)要求显式 connect() 之后才能 subscribe()
+      //
+      // 背景:openclaw 实战遇到"LaserStream 连接上但 0 tx" 的静默失败
+      //   - @triton-one/yellowstone-grpc v5.0.0+ 从 grpc-js 迁移到 napi-rs(Rust 实现)
+      //   - 官方说 "no breaking changes",但实操中 v5 必须先 client.connect()
+      //   - 否则 client.subscribe() 返回的 stream 没有真正绑定到 gRPC 连接
+      //   - 结果:stream.write(request) 不报错,server 也认你订阅,但 data 永远不到
+      //
+      // 兼容性:client.connect() 在老版本 SDK 里不存在(v4.x 及以前)
+      //   - typeof 检查避免 TypeError(老版没这个方法)
+      //   - v3 SDK 默认 lazy connect on first call,可直接 subscribe — 也兼容
+      if (typeof this.client.connect === 'function') {
+        await this.client.connect();
+      }
+
       this.stream = await this.client.subscribe();
 
       this.stream.on('data', (msg) => this._handleMessage(msg));
@@ -309,12 +325,35 @@ class TickStream extends EventEmitter {
     );
   }
 
+  /**
+   * 从 endpoint URL 提取 region 标签(用于日志/监控显示)
+   *
+   * v3.17.10 适配新 SDK URL 格式:
+   *   旧 (v1.x SDK 时代):https://laserstream-mainnet-fra.helius-rpc.com  → FRA
+   *   新 (v5.x SDK):     https://laserstream-fra.mainnet.helius-rpc.com  → FRA
+   *                       https://fra.laserstream.helius-rpc.com         → FRA
+   *
+   * 老正则 /(?:^|[\.\/\:])(fra|...)\b/i 对新格式可能匹配不到,
+   * 然后走 fallback host.split('.')[0] → "laserstream-mainnet-fra" → slice(0,6) → "LASERS"
+   * 结果 3 个 region 全显示 "LASERS",无法分辨哪个 region 慢。
+   *
+   * 修复:遍历整个 hostname,先匹配任何已知 region code,匹不到才走 host 前缀 fallback。
+   */
   _labelForEndpoint(endpoint, idx) {
-    const m = endpoint.match(/(?:^|[\.\/\:])(fra|ams|ewr|slc|tyo|sg|lax|lon|pitt)\b/i);
-    if (m) return m[1].toUpperCase();
+    const KNOWN_REGIONS = ['fra', 'ams', 'ewr', 'slc', 'tyo', 'sgp', 'sg', 'lax', 'lon', 'pitt', 'cpt'];
     try {
-      const host = endpoint.replace(/^https?:\/\//, '').split(/[:/]/)[0];
-      const first = host.split('.')[0];
+      const host = endpoint.replace(/^https?:\/\//, '').split(/[:/]/)[0].toLowerCase();
+      // 拆 host 为 token(按 . - _ 分割),逐个 token 检查是否是已知 region code
+      const tokens = host.split(/[\.\-_]/);
+      for (const t of tokens) {
+        if (KNOWN_REGIONS.includes(t)) {
+          // 标准化:sgp/sg 都显示成 SGP,其他大写
+          if (t === 'sg') return 'SGP';
+          return t.toUpperCase();
+        }
+      }
+      // 没匹配:取 host 第一个 token 大写,但跳过通用前缀
+      const first = tokens.find((t) => t && !['laserstream', 'mainnet', 'grpc', 'www'].includes(t));
       return (first || `R${idx}`).toUpperCase().slice(0, 6);
     } catch (_) {
       return `R${idx}`;
