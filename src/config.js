@@ -59,6 +59,17 @@ const config = {
     //     - 太长（> 10s）：错过早期快速反弹的入场窗口
     stabilizationMs: parseInt(process.env.STABILIZATION_MS || '5000', 10),
 
+    // v3.17.7: stabilization 期内 emergency_stop 的阈值
+    //   stabilization 期内"相对 entryPrice 的 PnL"不可靠（自买入推高+回归造成假亏损）
+    //   所以期间改用"相对样本最高价的回撤"判断 emergency
+    //   - max(samples) ≈ 自买入推高的池子价格峰值
+    //   - 从峰值真的跌此 % 才认作灾难（不是简单的相对 entryPrice 跌幅）
+    //   - 20% 既能放过"自买入回归"（通常 ≤ 10-12%），又能抓真的暴跌
+    //   设 0 禁用 stabilization 期内的 emergency_stop（极端 dangerous，不推荐）
+    stabilizationEmergencyDrawdownPct: parseFloat(
+      process.env.STABILIZATION_EMERGENCY_DRAWDOWN_PCT || '20.0',
+    ),
+
     // 紧急止损（防止灾难性下跌）
     // 设置为 0 可禁用紧急止损（恢复"硬扛"行为）
     emergencyStopLossPct: parseFloat(process.env.EMERGENCY_STOP_LOSS_PCT || '-15.0'),
@@ -79,6 +90,22 @@ const config = {
     //   实战案例：同一 seller_tx 在 2 分钟后被慢 region 重新推送 → 价格已跌 20% → 亏
     //   10 分钟覆盖最慢 region + 重启窗口，且通过 signals 表持久化（启动时恢复）
     sellerTxDedupMs: parseInt(process.env.SELLER_TX_DEDUP_MS || '600000', 10),
+
+    // v3.17.7: 同卖家+同代币 去重窗（毫秒）
+    //   防"持续出货"场景反复触发：同一 wallet 短时间内反复砸同一个代币
+    //   实战案例：ikG8tz5e 18 秒内对 POSITIONS 砸了 2 次（seller_tx 不同），
+    //             2 次都被买入 2 次都亏 — 这表明该卖家在持续出货，不是恐慌抛售
+    //   设 0 禁用此检查（恢复旧行为）
+    //   推荐 5-10 分钟，跟你的持仓最大时间 MAX_HOLD_MS 匹配
+    sellerMintDedupMs: parseInt(process.env.SELLER_MINT_DEDUP_MS || '600000', 10),
+
+    // v3.17.7: 信号过期检查（slot gap 阈值）
+    //   砸盘交易的 slot 与当前最新 slot 差超过此值就丢弃信号
+    //   实战案例：某些代币 LaserStream 推送延迟 48-88 秒（127-214 slot），
+    //             那时候反弹早结束，买在山顶 → emergency_stop 出场
+    //   20 slot ≈ 8 秒延迟（Solana ~400ms/slot），超过就拒绝
+    //   设 0 禁用此检查（恢复旧行为）
+    maxSignalSlotGap: parseInt(process.env.MAX_SIGNAL_SLOT_GAP || '20', 10),
   },
 
   // ============ Price anomaly filter ============
@@ -168,10 +195,15 @@ const config = {
   // BUY 和 SELL 分开配置：
   //   - BUY 是抢 slot 的（砸盘后所有 sniper 同抢），需要高 fee
   //   - SELL 是平仓的（晚 1-3 个 slot 落链没差别），低 fee 即可
-  // 实测竞争者：BUY 0.012-0.045 SOL，SELL <0.0001-0.003 SOL
+  // 实战竞争者数据(BABYTROLL slot):
+  //   排名1 93kgxYKe: priority fee 0.037 SOL,CU 111K → μL/CU 334M
+  //   排名2 3fZftz6m: priority fee 0.012 SOL,CU 110K → μL/CU 113M
+  //   我们 v3.17.7: fee 0.01,CU 163K → μL/CU 61M(排名4)
+  //   核心:Leader 排序看 priority fee / CU,不看 Jito tip
   priorityFee: {
     // 静态模式（dynamic=false 时使用）
-    buyMaxLamports: parseInt(process.env.BUY_MAX_PRIORITY_FEE_LAMPORTS || '20000000', 10),  // 0.02 SOL
+    // v3.17.9: buyMaxLamports 跟 buyMinLamports 同步拉到 0.08 SOL,留 dynamic 模式上探空间
+    buyMaxLamports: parseInt(process.env.BUY_MAX_PRIORITY_FEE_LAMPORTS || '80000000', 10),  // 0.08 SOL
     sellMaxLamports: parseInt(process.env.SELL_MAX_PRIORITY_FEE_LAMPORTS || '500000', 10),  // 0.0005 SOL
 
     // 动态模式：用 Helius getPriorityFeeEstimate 查 mempool 实时拥堵
@@ -183,8 +215,12 @@ const config = {
     buyLevel: process.env.BUY_PRIORITY_LEVEL || 'veryHigh',  // 抢入用最高级别
     sellLevel: process.env.SELL_PRIORITY_LEVEL || 'medium',  // 卖出用中等
 
-    // 动态查询的保底 (避免 RPC 返回 0/异常)
-    buyMinLamports: parseInt(process.env.BUY_MIN_PRIORITY_FEE_LAMPORTS || '10000000', 10),  // 0.01 SOL
+    // v3.17.9 实战校正:配合 CU 250K,priority fee 拉到 0.067 SOL 维持 μL/CU = 267M
+    //   v3.17.8: fee 0.04 / CU 111K = 360M μL/CU(目标超过排名1)
+    //   v3.17.9: fee 0.067 / CU 250K = 267M μL/CU(略低于排名1的 334M 但避免 BUY 爆)
+    //   ROI 算法:每笔多花 0.027 SOL fee 比每笔白花 0.04 fee 又没买到划算太多
+    //   动态模式下,Helius getPriorityFeeEstimate 通常返回更高值,此为下限保护
+    buyMinLamports: parseInt(process.env.BUY_MIN_PRIORITY_FEE_LAMPORTS || '67000000', 10),  // 0.067 SOL
     sellMinLamports: parseInt(process.env.SELL_MIN_PRIORITY_FEE_LAMPORTS || '100000', 10),  // 0.0001 SOL
 
     // 动态查询的上限 (即使 mempool 极拥堵也不超过)

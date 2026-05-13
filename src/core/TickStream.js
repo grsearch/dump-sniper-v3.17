@@ -25,7 +25,19 @@
  */
 
 const Client = require('@triton-one/yellowstone-grpc').default;
-const { CommitmentLevel } = require('@triton-one/yellowstone-grpc');
+const yellowstoneGrpc = require('@triton-one/yellowstone-grpc');
+const { CommitmentLevel } = yellowstoneGrpc;
+// v3.17.6: @triton-one/yellowstone-grpc v1.4+ 要求 stream.write 收到 protobuf message
+// 实例，而不是 plain JS object。新 napi-rs 路径下 plain object 会被静默拒收
+// （TCP 连接 OK、subscribe 调用不报错、stream.write 不报错，但 server 端拒绝
+//  序列化 → 永远收不到 data → "NEVER_BEAT" 告警）。
+// SubscribeRequest.create() / SubscribeRequestFilterTransactions.create() 能把
+// plain object 转成正确的 protobuf message。我们 defensive 导入：
+//   - 优先用 .create()（新版 SDK）
+//   - fallback 到 plain object（老版 SDK 兼容）
+const SubscribeRequest = yellowstoneGrpc.SubscribeRequest || null;
+const SubscribeRequestFilterTransactions =
+  yellowstoneGrpc.SubscribeRequestFilterTransactions || null;
 const EventEmitter = require('events');
 const bs58Lib = require('bs58');
 const bs58 = bs58Lib.default || bs58Lib;
@@ -168,16 +180,22 @@ class RegionStream {
   async _sendSubscribeRequest() {
     const mints = this._currentMints;
     if (mints.length === 0) return;
-    const request = {
-      transactions: {
-        pumpAmmTrades: {
-          vote: false,
-          failed: false,
-          accountInclude: mints,
-          accountExclude: [],
-          accountRequired: [PUMP_AMM_PROGRAM_ID],
-        },
-      },
+
+    // v3.17.6 兼容修复：新版 SDK 要求 protobuf message 实例
+    // 先建 filter，再建 request；如果 .create 可用就用，否则 fallback plain object
+    const filterPlain = {
+      vote: false,
+      failed: false,
+      accountInclude: mints,
+      accountExclude: [],
+      accountRequired: [PUMP_AMM_PROGRAM_ID],
+    };
+    const filter = SubscribeRequestFilterTransactions
+      ? SubscribeRequestFilterTransactions.create(filterPlain)
+      : filterPlain;
+
+    const requestPlain = {
+      transactions: { pumpAmmTrades: filter },
       slots: {},
       accounts: {},
       blocks: {},
@@ -187,6 +205,10 @@ class RegionStream {
       accountsDataSlice: [],
       commitment: CommitmentLevel.PROCESSED,
     };
+    const request = SubscribeRequest
+      ? SubscribeRequest.create(requestPlain)
+      : requestPlain;
+
     return new Promise((resolve, reject) => {
       this.stream.write(request, (err) => {
         if (err) reject(err);
@@ -252,6 +274,9 @@ class TickStream extends EventEmitter {
     super();
     this.watchedMints = new Set();
     this.shouldRun = false;
+    // v3.17.7: 最新观察到的 slot（任何 region 都更新，dedup 去重不影响）
+    //   用于 SignalEngine 判断"砸盘信号 vs 当前最新 slot"差距，过滤陈旧信号
+    this._latestSlot = 0;
 
     this.regions = [];
     this.dedup = new SignatureDedup();
@@ -348,6 +373,18 @@ class TickStream extends EventEmitter {
   _handleRegionTx(txMessage, region) {
     const sig = extractSignature(txMessage);
     const isFirst = this.dedup.shouldProcess(sig);
+
+    // v3.17.7: 跟踪最新 slot —— 任何 region 推过来的都更新（包括 dedup_dup 那些）
+    // 用于下游 SignalEngine 判断信号是否过期（slot gap 检查）
+    const slotRaw = txMessage?.slot;
+    if (slotRaw != null) {
+      // yellowstone-grpc 把 slot 编码成 string 或 number，都转 Number
+      const slot = typeof slotRaw === 'string' ? Number(slotRaw) : slotRaw;
+      if (Number.isFinite(slot) && slot > this._latestSlot) {
+        this._latestSlot = slot;
+      }
+    }
+
     if (!isFirst) {
       monitor.inc(`TickStream.${region}.dedup_dup`, 1, 'TickStream');
       monitor.inc('TickStream.dedupDups', 1, 'TickStream');
@@ -357,7 +394,13 @@ class TickStream extends EventEmitter {
     monitor.inc('TickStream.txReceived', 1, 'TickStream');
     monitor.beat('TickStream', `tx_first:${region}`);
     monitor.set('TickStream.dedupSize', this.dedup.size(), 'TickStream');
+    monitor.set('TickStream.latestSlot', this._latestSlot, 'TickStream');
     this.emit('transaction', txMessage, { firstRegion: region });
+  }
+
+  /** v3.17.7: 暴露 latestSlot 给 SignalEngine 做过期判断 */
+  get latestSlot() {
+    return this._latestSlot;
   }
 }
 

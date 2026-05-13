@@ -240,6 +240,48 @@ class PositionManager extends EventEmitter {
           signature,
         });
       });
+
+      // v3.17.9: reconcile watchdog —— 兜底机制
+      //   背景:openclaw 实战发现 1 笔 BUY 链上 ProgramFailedToComplete,
+      //         token 没到账,但 status 一直停在 open(认为买成功)。
+      //         理论上 _reconcileBuyAsync 应该检测到 confirmed=false 并关闭 position,
+      //         但实战中存在异常路径导致 reconcile 没正常工作:
+      //           - setImmediate / Promise 异常被吞(已 catch 但实际可能没触发)
+      //           - confirmTx 内部 RPC 长期阻塞(>60s)
+      //           - getSignatureStatuses 对失败 tx 返回 null,poll 到超时(8s)然后正常关闭
+      //             但极端情况下 poll 异常 → reconcile 退出但没标记
+      //   兜底:开仓后 60 秒 watchdog
+      //         如果 position 仍存在 AND reconciled=false → 强制按"BUY chain failed"处理
+      //         (60s 远大于正常 reconcile 完成时间 1-3s,正常路径不会触发)
+      const watchdogTimer = setTimeout(() => {
+        const p = this.positions.get(pid);
+        if (p && !p.reconciled && !p.exiting) {
+          console.error(
+            `[PositionManager] ⚠️ reconcile watchdog: ${p.symbol || mint.slice(0, 6)} ` +
+              `still un-reconciled after 60s → forcing BUY_CHAIN_FAILED`,
+          );
+          monitor.inc('PositionManager.reconcileWatchdog', 1, 'PositionManager');
+          const feeSol = ((p.buyFeeLamports || 0) + 5000) / 1e9;
+          try {
+            this.tradeLogger.closePosition(pid, {
+              closedAt: Date.now(),
+              exitPrice: p.entryPrice,
+              exitSol: 0,
+              pnlSol: -feeSol,
+              pnlPct: -100,
+              exitReason: 'BUY_RECONCILE_TIMEOUT',
+              sellSignature: null,
+            });
+          } catch (err) {
+            monitor.recordError('PositionManager', err, { phase: 'watchdog_close' });
+          }
+          this.positions.delete(pid);
+          this.byMint.delete(mint);
+          monitor.set('PositionManager.openCount', this.positions.size, 'PositionManager');
+        }
+      }, 60_000);
+      if (watchdogTimer.unref) watchdogTimer.unref();
+      pos._reconcileWatchdog = watchdogTimer;
     }
     return pos;
   }
@@ -297,6 +339,11 @@ class PositionManager extends EventEmitter {
         signature,
         error: errMsg,
       });
+      // v3.17.9: 清 watchdog
+      if (pos._reconcileWatchdog) {
+        clearTimeout(pos._reconcileWatchdog);
+        pos._reconcileWatchdog = null;
+      }
       this.emit('buyChainFailed', { positionId, mint, symbol: pos.symbol, signature, error: errMsg });
       return;
     }
@@ -326,6 +373,11 @@ class PositionManager extends EventEmitter {
       this.byMint.delete(mint);
       monitor.inc('PositionManager.buyFailedClosed', 1, 'PositionManager');
       monitor.set('PositionManager.openCount', this.positions.size, 'PositionManager');
+      // v3.17.9: 清 watchdog
+      if (pos._reconcileWatchdog) {
+        clearTimeout(pos._reconcileWatchdog);
+        pos._reconcileWatchdog = null;
+      }
       return;
     }
 
@@ -387,6 +439,12 @@ class PositionManager extends EventEmitter {
     //        进入 stabilization 模式（_checkExit 内部判断 stabilizing 时只跑 emergency）
     pos.reconciled = true;
 
+    // v3.17.9: reconcile 正常完成,清掉 watchdog 避免 60s 后误触发
+    if (pos._reconcileWatchdog) {
+      clearTimeout(pos._reconcileWatchdog);
+      pos._reconcileWatchdog = null;
+    }
+
     // 同步到 DB
     this.tradeLogger.updatePositionEntry(positionId, {
       entrySol: pos.entrySol,
@@ -446,23 +504,45 @@ class PositionManager extends EventEmitter {
 
     const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
 
-    // ============ 1. 紧急止损：救命路径，不双确认，stabilization 期也工作 ============
-    // emergency_stop 在任何阶段都是兜底，即使在 stabilization 期内也要响应
-    const emergencyPct = config.strategy.emergencyStopLossPct;
-    if (emergencyPct < 0 && pnlPct <= emergencyPct) {
-      console.warn(
-        `[PositionManager] 🚨 EMERGENCY_STOP ${pos.symbol || pos.mint.slice(0, 6)} ` +
-          `pnl=${pnlPct.toFixed(2)}%${pos.stabilizing ? ' (during stabilization)' : ''}`,
-      );
-      this._exit(pos, price, 'EMERGENCY_STOP');
-      return;
-    }
-
-    // ============ v3.17.6 stabilization 期处理 ============
+    // ============ v3.17.7 stabilization 期处理 ============
     // 期间只收集价格样本，不更新 HWM，不武装 trailing，不检查 TP
     // 期满时取样本中位数作为 stabilizedBaseline，过滤砸盘瞬态 + 自买入推高
     if (pos.stabilizing) {
       pos._stabilizeSamples.push(price);
+
+      // ============ stabilization 期内的紧急止损 ============
+      //
+      // 设计动机：
+      //   实战发现 stabilization 期内直接用"相对 entryPrice"的 -15% 阈值会误杀。
+      //   根因：3 SOL 买入推高 30 SOL 池子 ~10%，然后价格回归，第一个 tick 就是
+      //         "相对 entryPrice -15%" 的假信号。但这是自买入造成的虚高回归，
+      //         不是市场灾难。
+      //
+      //   openclaw 的修复：stabilization 期 emergency 阈值放宽到 -30%
+      //     问题：拍脑袋的数字。如果真的暴跌 -25%，会被放过 5 秒。
+      //
+      //   我的方案：stabilization 期改用"相对样本最高价的回撤"判断 emergency
+      //     - max(samples) ≈ 自买入推高的峰值
+      //     - 从这个峰值真的跌 stabilizationEmergencyDrawdownPct%（默认 20%）才认作灾难
+      //     - 这样能区分"AMM 自然回归" vs "真实大跌"
+      //     - 例：entryPrice 估算 8.2e-6，buy 后样本 [7.5, 7.3, 7.1]，max=7.5
+      //           当前 6.8 → 回撤 9.3%，不触发（这正是 openclaw 想避免的误杀场景）
+      //           若当前 5.8 → 回撤 22.7%，触发 emergency（真灾难）
+      const sampleMax = pos._stabilizeSamples.reduce(
+        (m, p) => (p > m ? p : m),
+        pos.entryPrice,
+      );
+      const drawdownFromMax = ((sampleMax - price) / sampleMax) * 100;
+      const stabEmergencyDD = config.strategy.stabilizationEmergencyDrawdownPct;
+      if (stabEmergencyDD > 0 && drawdownFromMax >= stabEmergencyDD) {
+        console.warn(
+          `[PositionManager] 🚨 EMERGENCY_STOP (stabilization) ${pos.symbol || pos.mint.slice(0, 6)} ` +
+            `drawdown ${drawdownFromMax.toFixed(2)}% from stabilization peak ` +
+            `(sampleMax=${sampleMax.toExponential(3)}, current=${price.toExponential(3)}, pnl=${pnlPct.toFixed(2)}%)`,
+        );
+        this._exit(pos, price, 'EMERGENCY_STOP');
+        return;
+      }
 
       const elapsed = Date.now() - pos.reconciledAt;
       const stabilizeMs = config.strategy.stabilizationMs;
@@ -495,6 +575,17 @@ class PositionManager extends EventEmitter {
         monitor.set('PositionManager.lastStabilizeSamples', samples.length, 'PositionManager');
       }
       // stabilizing 期内不进入 TP / trailing 流程，直接 return
+      return;
+    }
+
+    // ============ 1. 紧急止损（非 stabilization 期）：救命路径，不双确认 ============
+    const emergencyPct = config.strategy.emergencyStopLossPct;
+    if (emergencyPct < 0 && pnlPct <= emergencyPct) {
+      console.warn(
+        `[PositionManager] 🚨 EMERGENCY_STOP ${pos.symbol || pos.mint.slice(0, 6)} ` +
+          `pnl=${pnlPct.toFixed(2)}%`,
+      );
+      this._exit(pos, price, 'EMERGENCY_STOP');
       return;
     }
 
@@ -760,6 +851,34 @@ class PositionManager extends EventEmitter {
     console.warn(
       `[PositionManager] SELL submitted but not confirmed: ${pos.symbol || pos.mint.slice(0, 6)}: ${errMsg}`,
     );
+
+    // v3.17.8: 双保险 — confirmTx 超时(15s)不等于交易失败
+    //   实战发现:10 笔 stuck position 链上 SELL 其实都成功了,只是 confirmTx 没等到
+    //   原因:网络抖动 / RPC subscribeSignature 错过通知 / tx 实际在 18-30s 后才确认
+    //   修复:confirm 失败后再直接拉一次链上 tx,如果 fetchTxSwapResult 成功 → 走 success 路径
+    //   不能完全依赖这条路径 — 它可能也失败(tx 真的没落链),所以失败时仍走 retry
+    try {
+      const swap = await this.executor.fetchTxSwapResult(signature, pos.mint);
+      if (swap && swap.realSolDelta > 0 && pos.tokenAmount > 0) {
+        const realSolOut = swap.realSolDelta;
+        const realExitPrice = realSolOut / pos.tokenAmount;
+        monitor.inc('PositionManager.sellRecoveredFromTimeout', 1, 'PositionManager');
+        console.log(
+          `[PositionManager] ✅ SELL actually landed (recovered from confirm timeout) ` +
+            `${pos.symbol || pos.mint.slice(0, 6)}: realSol=${realSolOut.toFixed(4)}`,
+        );
+        this._finalizeSuccess(pos, realExitPrice, realSolOut, signature);
+        return;
+      }
+    } catch (err) {
+      // fetchTxSwapResult 也失败 → 真的没落链或链上 tx 失败,继续 retry 流程
+      monitor.recordError('PositionManager', err, {
+        phase: 'sell_recovery_fetch',
+        mint: pos.mint,
+        signature,
+      });
+    }
+
     this._scheduleRetryOrStuck(pos, triggerPrice, errMsg);
   }
 

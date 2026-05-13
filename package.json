@@ -1,7 +1,7 @@
 {
   "name": "dump-sniper",
-  "version": "3.17.6",
-  "description": "Solana Pump.fun dump-rebound sniper. v3.17.6: trailing stop with stabilization, multi-region LaserStream/Sender, full BUY+SELL on-chain reconcile.",
+  "version": "3.17.9",
+  "description": "Solana Pump.fun dump-rebound sniper. v3.17.9: CU calibration to 250K (5 chain-failed BUYs), reconcile watchdog, BUY chain fail alerts.",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -12,7 +12,8 @@
     "latency": "node scripts/latency-analyze.js",
     "dissect": "node scripts/latency-dissect.js",
     "strategy": "node scripts/strategy-analyze.js",
-    "stuck": "node scripts/stuck.js"
+    "stuck": "node scripts/stuck.js",
+    "analyze": "node scripts/analyze.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",

@@ -73,8 +73,9 @@ async function main() {
     priceTracker,
     tokenRegistry,
   });
-  const signalEngine = new SignalEngine({ tradeLogger, positionManager });
+  // v3.17.7: tickStream 必须先于 signalEngine 创建（signalEngine 需要它的 latestSlot getter）
   const tickStream = new TickStream();
+  const signalEngine = new SignalEngine({ tradeLogger, positionManager, tickStream });
 
   // ============ 报告 ============
   const dailyReport = new DailyReport({ tradeLogger, tokenRegistry });

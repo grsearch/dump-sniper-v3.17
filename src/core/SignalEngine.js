@@ -32,15 +32,22 @@ monitor.registerModule('SignalEngine', { staleMs: 3600_000, label: 'Signal Engin
  *           恢复最近 N 分钟内 accepted=1 的 seller_tx 进内存，重启不丢。
  */
 class SignalEngine extends EventEmitter {
-  constructor({ tradeLogger, positionManager }) {
+  constructor({ tradeLogger, positionManager, tickStream = null }) {
     super();
     this.tradeLogger = tradeLogger;
     this.positionManager = positionManager;
+    // v3.17.7: 可选 tickStream 引用，用于读 latestSlot 做信号过期判断
+    //   不传也能工作（fallback：不做过期检查）
+    this.tickStream = tickStream;
     this.lastTriggerTs = new Map();    // mint → ts
     this.ourSignatures = new Set();    // 我们自己发出的 tx 签名（避免自触发）
     this.inflightBuys = new Set();     // 正在 buy 但还没 registerOpen 的 mint（防并发超额）
     // v3.17.6: 已经触发过买入的砸单 tx → expireAt
     this.triggeredSellerTxs = new Map();
+    // v3.17.7: 已经触发过买入的 (seller wallet × mint) → expireAt
+    //   防"同一卖家持续出货"反复触发买入（不同 seller_tx 但同一钱包同一币）
+    //   实战案例：ikG8tz5e 18 秒内对 POSITIONS 砸了 2 次，2 次都被买入，2 次都亏
+    this.triggeredSellerMintPairs = new Map();
 
     // 启动时从 DB 恢复最近的 accepted seller_tx，防止重启后 LaserStream 重推同砸单
     this._restoreSellerTxsFromDb();
@@ -90,8 +97,16 @@ class SignalEngine extends EventEmitter {
         cleaned += 1;
       }
     }
+    // v3.17.7: 同样清理 sellerMintPairs
+    for (const [key, expireAt] of this.triggeredSellerMintPairs) {
+      if (expireAt <= now) {
+        this.triggeredSellerMintPairs.delete(key);
+        cleaned += 1;
+      }
+    }
     if (cleaned > 0) {
       monitor.set('SignalEngine.sellerTxsTracked', this.triggeredSellerTxs.size, 'SignalEngine');
+      monitor.set('SignalEngine.sellerMintPairsTracked', this.triggeredSellerMintPairs.size, 'SignalEngine');
     }
   }
 
@@ -114,7 +129,7 @@ class SignalEngine extends EventEmitter {
 
   handleDumpSignal(signal) {
     monitor.beat('SignalEngine', 'signal');
-    const { mint, symbol, sellSol, priceImpactPct, seller, signature, ts } = signal;
+    const { mint, symbol, sellSol, priceImpactPct, seller, signature, ts, slot } = signal;
 
     // 1. 自触发过滤
     if (signature && this.ourSignatures.has(signature)) {
@@ -123,7 +138,28 @@ class SignalEngine extends EventEmitter {
       return;
     }
 
-    // 2. v3.17.6: 同砸单去重 — 同一 seller_tx 在 sellerTxDedupMs 内不重复触发
+    // 2. v3.17.7: slot 过期检查 — 砸盘 slot 太老就丢弃
+    //    根因：LaserStream 多 region 仍然可能对某些代币推送延迟 48-88 秒
+    //    （127+ slot），那时候反弹早结束，买在山顶 → emergency_stop 出场
+    //    例：POSITIONS 监测到 9 笔信号，3 笔慢的 slot gap 121-214（延迟 48-88s），全亏
+    //    设 maxSignalSlotGap=0 可禁用此检查（fallback 旧行为）
+    const maxSlotGap = config.strategy.maxSignalSlotGap;
+    if (maxSlotGap > 0 && slot && this.tickStream) {
+      const latestSlot = this.tickStream.latestSlot || 0;
+      if (latestSlot > 0) {
+        const slotGap = latestSlot - slot;
+        if (slotGap > maxSlotGap) {
+          monitor.inc('SignalEngine.rejectedSlotGapTooLarge', 1, 'SignalEngine');
+          this._logReject(
+            signal,
+            `slot gap too large: dump@${slot}, now@${latestSlot}, gap=${slotGap} (>${maxSlotGap}, ~${(slotGap * 0.4).toFixed(0)}s late)`,
+          );
+          return;
+        }
+      }
+    }
+
+    // 3. v3.17.6: 同砸单去重 — 同一 seller_tx 在 sellerTxDedupMs 内不重复触发
     //    防止 LaserStream 多 region 跨越 dedup TTL 后重推同一砸单
     if (signature && this.triggeredSellerTxs.has(signature)) {
       const expireAt = this.triggeredSellerTxs.get(signature);
@@ -132,11 +168,31 @@ class SignalEngine extends EventEmitter {
         this._logReject(signal, `duplicate seller_tx (already triggered, expires in ${Math.round((expireAt - Date.now()) / 1000)}s)`);
         return;
       }
-      // 已过期：删了走正常流程
       this.triggeredSellerTxs.delete(signature);
     }
 
-    // 3. 冷却
+    // 4. v3.17.7: 同卖家×同mint去重 — 防"持续出货"场景反复触发
+    //    实战案例：同一卖家 ikG8tz5e 18 秒内对 POSITIONS 砸了 2 次
+    //    （seller_tx 不同，但 seller wallet + mint 相同），2 次都被买入 2 次都亏
+    //    这表明该卖家在持续出货,不是一次性恐慌抛售,买入反弹概率小
+    //    设 sellerMintDedupMs=0 可禁用此检查
+    if (seller && mint && config.strategy.sellerMintDedupMs > 0) {
+      const key = `${seller}:${mint}`;
+      const expireAt = this.triggeredSellerMintPairs.get(key);
+      if (expireAt && expireAt > Date.now()) {
+        monitor.inc('SignalEngine.rejectedSellerMintPair', 1, 'SignalEngine');
+        this._logReject(
+          signal,
+          `same seller+mint cooldown (seller ${seller.slice(0, 6)}.. dumped ${symbol || mint.slice(0, 6)} again, expires in ${Math.round((expireAt - Date.now()) / 1000)}s)`,
+        );
+        return;
+      }
+      if (expireAt) {
+        this.triggeredSellerMintPairs.delete(key);
+      }
+    }
+
+    // 5. 冷却
     const last = this.lastTriggerTs.get(mint);
     if (last && Date.now() - last < config.strategy.cooldownMsPerToken) {
       monitor.inc('SignalEngine.rejectedCooldown', 1, 'SignalEngine');
@@ -144,7 +200,7 @@ class SignalEngine extends EventEmitter {
       return;
     }
 
-    // 4. 并发限制（同时计算已开仓 + 正在 buy 的）
+    // 6. 并发限制（同时计算已开仓 + 正在 buy 的）
     const openCount = this.positionManager.openPositionCount();
     const inflightCount = this.inflightBuys.size;
     const totalSlotsUsed = openCount + inflightCount;
@@ -157,7 +213,7 @@ class SignalEngine extends EventEmitter {
       return;
     }
 
-    // 5. 同代币当前已有持仓 OR 正在 buy 中
+    // 7. 同代币当前已有持仓 OR 正在 buy 中
     if (this.positionManager.hasOpenPosition(mint) || this.inflightBuys.has(mint)) {
       monitor.inc('SignalEngine.rejectedAlreadyHolding', 1, 'SignalEngine');
       this._logReject(signal, this.inflightBuys.has(mint) ? 'buy in-flight' : 'already holding');
@@ -174,6 +230,16 @@ class SignalEngine extends EventEmitter {
       this.triggeredSellerTxs.set(signature, Date.now() + dedupMs);
       monitor.set('SignalEngine.sellerTxsTracked', this.triggeredSellerTxs.size, 'SignalEngine');
     }
+    // v3.17.7: 记录此 seller+mint pair
+    if (seller && mint && config.strategy.sellerMintDedupMs > 0) {
+      const key = `${seller}:${mint}`;
+      this.triggeredSellerMintPairs.set(key, Date.now() + config.strategy.sellerMintDedupMs);
+      monitor.set('SignalEngine.sellerMintPairsTracked', this.triggeredSellerMintPairs.size, 'SignalEngine');
+    }
+
+    // v3.17.7: 日志带上 slot 和 slot gap（用于事后分析延迟分布）
+    const latestSlot = this.tickStream ? (this.tickStream.latestSlot || 0) : 0;
+    const slotGap = (slot && latestSlot) ? (latestSlot - slot) : null;
 
     // v3.10: 先 emit buyOrder（让 Executor 立即开始工作），再异步写 DB
     // SQLite WAL 模式下写入也要 1-3ms，省下来给关键路径
@@ -186,7 +252,9 @@ class SignalEngine extends EventEmitter {
     console.log(
       `[SignalEngine] ✅ BUY_SIGNAL ${symbol || mint.slice(0, 6)}: sell=${sellSol.toFixed(
         2,
-      )} SOL, impact=-${priceImpactPct.toFixed(2)}%, seller_tx=${signature ? signature.slice(0, 8) + '..' : 'n/a'}`,
+      )} SOL, impact=-${priceImpactPct.toFixed(2)}%, seller=${seller ? seller.slice(0, 6) + '..' : 'n/a'}, ` +
+        `seller_tx=${signature ? signature.slice(0, 8) + '..' : 'n/a'}` +
+        (slotGap !== null ? `, slot_gap=${slotGap}` : ''),
     );
 
     // 异步写 DB（不阻塞 BUY 路径）
@@ -202,7 +270,8 @@ class SignalEngine extends EventEmitter {
           priceImpactPct,
           seller,
           sellerTx: signature,
-          notes: `dump signal accepted; sellSol=${sellSol.toFixed(2)}, impact=${priceImpactPct.toFixed(2)}%`,
+          notes: `accepted; sellSol=${sellSol.toFixed(2)}, impact=${priceImpactPct.toFixed(2)}%` +
+                 (slotGap !== null ? `, slot_gap=${slotGap}` : ''),
           accepted: true,
         });
       } catch (err) {

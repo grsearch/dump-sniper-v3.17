@@ -113,6 +113,7 @@ class DumpDetector extends EventEmitter {
           seller: parsed.signer,
           signature: parsed.signature,
           ts: parsed.ts,
+          slot: parsed.slot, // v3.17.7: 砸盘交易的链上 slot
           poolAddress: parsed.poolAddress,
           poolBaseVault: parsed.poolBaseVault,
           poolQuoteVault: parsed.poolQuoteVault,
@@ -145,6 +146,13 @@ class DumpDetector extends EventEmitter {
     if (!tx) return null;
     const meta = tx.meta;
     if (!meta || meta.err) return null;
+
+    // v3.17.7: 提取 slot 用于下游过期判断
+    // yellowstone gRPC 把 slot 编码成 string，我们一路传到 SignalEngine
+    const slotRaw = txMessage.slot;
+    const slot = slotRaw != null
+      ? (typeof slotRaw === 'string' ? Number(slotRaw) : slotRaw)
+      : null;
 
     const signature = this._extractSignature(tx);
     const signer = this._extractSigner(tx);
@@ -264,6 +272,7 @@ class DumpDetector extends EventEmitter {
       signature,
       signer,
       ts: Date.now(),
+      slot, // v3.17.7: 砸盘交易的链上 slot（用于 SignalEngine 判过期）
       side,
       baseMint,
       baseDecimals,

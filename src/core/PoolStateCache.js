@@ -151,6 +151,26 @@ class PoolStateCache {
       const targets = list.filter((t) => t.poolAddress);
       if (targets.length === 0) return;
 
+      // v3.17.8: 清理 cache 中已不在监控列表的 token
+      //   实战:长时间运行后 cache 永不收缩(只 set 不 delete),token 被移出监控后
+      //   仍占用内存,且后台刷新逻辑用 `targets`(当前监控列表)所以失效的 entry
+      //   永远不会被刷新但永远在 cache 里。配合 Helius 限流,长跑后 RESOURCE_EXHAUSTED。
+      //   修复:每轮刷新前先把 cache 中"不在 targets 中"的 entry 删掉。
+      //   注意:这个清理放在 _refreshAll 而不是单独 timer,是因为它依赖 getMintList,
+      //         自然在每个 refresh tick 跑一次,无需额外定时器。
+      const activeAddresses = new Set(targets.map((t) => t.poolAddress));
+      let removed = 0;
+      for (const addr of this.cache.keys()) {
+        if (!activeAddresses.has(addr)) {
+          this.cache.delete(addr);
+          removed += 1;
+        }
+      }
+      if (removed > 0) {
+        monitor.inc('PoolStateCache.evicted', removed, 'PoolStateCache');
+        console.log(`[PoolStateCache] evicted ${removed} stale entries (not in active mint list)`);
+      }
+
       // 计算每个 tick 应该刷新的数量
       // 目标：每个 token 在 refreshIntervalMs 周期内被刷一次
       const tokensPerCycle = targets.length;

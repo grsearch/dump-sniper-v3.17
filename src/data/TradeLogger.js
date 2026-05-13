@@ -193,8 +193,19 @@ class TradeLogger {
         `SELECT * FROM positions WHERE status = 'stuck' AND closed_at IS NULL
          ORDER BY opened_at DESC`,
       ),
+      // v3.17.8: 加 status 字段双重校验
+      //   原查询 `closed_at IS NULL` 不够稳健 — 如果有人手动 UPDATE status='closed' 但忘
+      //   填 closed_at,这些"实际已关闭但 DB 异常"的行会被恢复成 open,出现:
+      //     PositionManager 启动时 restoredPositions=N
+      //     但 dashboard / openPositionCount 显示这些仓位
+      //     实际链上 token 早就没了
+      //   双条件保护:既要 closed_at IS NULL,也要 status 不是 closed
+      //   注意:'sell_pending'/'sell_confirming'/'stuck' 这些中间状态仍能恢复,符合预期
       getOpenPositions: this.db.prepare(
-        `SELECT * FROM positions WHERE closed_at IS NULL ORDER BY opened_at ASC`,
+        `SELECT * FROM positions
+         WHERE closed_at IS NULL
+           AND (status IS NULL OR status != 'closed')
+         ORDER BY opened_at ASC`,
       ),
       getRecentSignals: this.db.prepare(`SELECT * FROM signals ORDER BY ts DESC LIMIT ?`),
       getRecentTrades: this.db.prepare(`SELECT * FROM trades ORDER BY ts DESC LIMIT ?`),

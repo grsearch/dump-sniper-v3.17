@@ -96,21 +96,37 @@ class Executor {
     }
 
     this.maxPriorityFeeLamports = config.maxPriorityFeeLamports;
-    // v3.17.6: CU limit 默认从 200K 降到 170K
-    //   原因：实测 BUY 实际消耗 135-146K CU，200K 余量 25% 浪费了
-    //   μL/CU 排序：fee/CU，CU 越大单价越低 → 同 slot 排序越靠后
-    //   170K = 146K + 17% 余量，给 HERMES 这种带 fee_program CPI 的 swap 留够
-    //   监控：cuNearLimit 计数器（≥90% 利用率告警），如有触发应立刻调回 200K
-    this.computeUnitLimit = parseInt(process.env.COMPUTE_UNIT_LIMIT || '170000', 10);
+    // v3.17.9 实战校正:CU limit 111K → 250K
+    //   背景:v3.17.8 把 CU 降到 111K(对标 BABYTROLL slot 排名1的 93kgxYKe)
+    //         但 openclaw 实战 5 笔 BUY 全部 ProgramFailedToComplete:
+    //           Nigga:    CU limit 150K, consumed 150K → 爆
+    //           GKC #1:   CU limit 150K, consumed 150K → 爆
+    //           GKC #2:   CU limit 170K, consumed 170K → 爆
+    //           CROWDCAM: CU limit 150K, consumed 149,403 → 99.6% 差点爆
+    //           BABYTROLL: CU limit 150K, consumed 144,912 → 96.6% 差点爆
+    //         总损失:5 × 0.04 SOL priority fee = 0.2 SOL 白花,token 没买到
+    //   真相:Pump swap 实际 CU 消耗有很大方差(137K-200K+),不是固定 111K-150K
+    //         BABYTROLL slot 那一次 93kgxYKe 用 111K 成功只是巧合(那笔 swap 状态简单)
+    //         实战必须设到 250K 给足余量,避免 BUY_CHAIN_FAILED
+    //   代价:CU 250K 后 μL/CU 排名会下降 → 需要拉高 priority fee 补偿
+    //         配合 BUY_MIN_PRIORITY_FEE 0.04 → 0.067 SOL,μL/CU 仍为 267M
+    //   ROI 算法:每笔多花 0.027 SOL priority fee 比每笔白花 0.04 fee 又没买到划算太多
+    //   未来优化:不同代币不同 CU(根据历史消耗自动调) — 复杂度高,暂不做
+    this.computeUnitLimit = parseInt(process.env.COMPUTE_UNIT_LIMIT || '250000', 10);
 
     // v3.5: 通过 setPoolStateCache 由外部注入（避免循环依赖 TokenRegistry）
     this.poolStateCache = null;
 
-    // v3.13: Jito tip — Helius Sender 路径需要 ≥ 0.001 SOL tip 才能走 Jito 通道
-    // 不配置 → tx 只走 staked validator 通道（错过 Jito MEV 通道）
-    // 配置 0.001+ SOL → 双通道（staked + Jito auction），同 slot 命中率提升
-    // 8 个 Jito tip 账户，每笔 BUY 随机选一个（避免账户写锁竞争）
-    this.jitoTipLamports = parseInt(process.env.JITO_TIP_LAMPORTS || '0', 10);
+    // v3.17.8 实战调优:Jito tip 0 → 0.003 SOL(3M lamports)
+    //   背景:BABYTROLL 数据显示 leader 排序看 μL/CU,Jito tip 不算其中
+    //         顶级对手 93kgxYKe / 3fZftz6m 都没用 tip
+    //   但保留 0.003 作为 Jito 通道最低兜底:
+    //     - Helius Sender 走 Jito 通道需要 tip ≥ 0.001 SOL(实际推荐 0.003 更稳)
+    //     - 不配 → tx 只走 staked validator 通道,错过 Jito 单 tx 拍卖机会
+    //     - 配低 → 双通道(staked + Jito),0.003 SOL = 微小成本但保留可能性
+    //   不再加大 tip:因为 leader 排序看 μL/CU,加大 tip 不提升 slot 内排名
+    //   8 个 Jito tip 账户,每笔 BUY 随机选一个(避免账户写锁竞争)
+    this.jitoTipLamports = parseInt(process.env.JITO_TIP_LAMPORTS || '3000000', 10);
     // v3.16: Helius Sender 官方 tip 账户列表（10 个）
     // ⚠️ 之前用的 Jito 官方 8 个账户是错的 — Helius Sender 拒绝它们
     // 来源: https://www.helius.dev/docs/sending-transactions/sender (2026)

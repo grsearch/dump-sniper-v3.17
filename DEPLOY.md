@@ -409,6 +409,14 @@ A: 监控列表里的 token 砸盘事件本来就稀疏,要等。同时检查:
 - token 是否补到 pool 信息(`SELECT mint, pool_address FROM tokens WHERE pool_address IS NULL`)
 - LaserStream 是否正常推送(看 `TickStream.txReceived` counter 在涨)
 
+**Q: 启动后看到 `tickstream.no_traffic LaserStream 监控 N 个代币,但 60s+ 无 tx 收到` 这种告警?**
+A: 这通常是 `@triton-one/yellowstone-grpc` SDK 版本兼容问题:
+- v3.17.6 已经修了 — `TickStream._sendSubscribeRequest` 会用 `SubscribeRequest.create()` 把请求包装成 protobuf message,适配新版 SDK(v1.4+ 和 v5+ napi-rs 路径)
+- 如果你装的是更老的 v3.17 还没修这个,升级到 v3.17.6
+- 另一个可能:`HELIUS_LASERSTREAM_TOKEN` 错了或者过期。Helius dashboard 重新生成一个。
+- 检查 TickStream 是否真的 connected:日志里应该有 `[TickStream:FRA] connected, watching N mints`。如果只有 `rebuilding` 没有 `connected`,看 `err.log` 有没有 gRPC 错误。
+- **诊断命令**:`sudo journalctl -u dump-sniper --since "5 min ago" | grep -E "TickStream|laserstream"`
+
 **Q: BUY 一直失败,日志显示 `Sender race failed`?**
 A: 检查:
 - `JITO_TIP_LAMPORTS` 是否 ≥ 200000(Helius Sender 最低要求)

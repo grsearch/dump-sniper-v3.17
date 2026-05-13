@@ -1,12 +1,38 @@
 # v3.17.6 升级说明
 
-> 本版本基于 v3.17 实战 24 小时数据驱动迭代,修复了 5 个 bug + 1 个策略优化。
+> 本版本基于 v3.17 实战 24 小时数据驱动迭代,修复了 5 个 bug + 1 个策略优化 + 1 个 SDK 兼容修复。
 > 新服务器全新部署:直接按 `DEPLOY.md` 操作即可。
 > 从 v3.17 升级:`git pull && systemctl restart dump-sniper`,**但要按下方"必读 .env 调整"改 env**。
 
 ---
 
-## 改了什么(6 个改动)
+## 改了什么(7 个改动)
+
+### 0. 关键 Bug:SDK 兼容性 — LaserStream 启动后收不到任何 tx ("NEVER_BEAT")
+
+**症状**:服务启动正常,日志显示 `TickStream initialized` 和 `connected`,但 60s+ 后告警:
+```
+[WARN] tickstream.no_traffic LaserStream 监控 N 个代币,但 60s+ 无 tx 收到 ...
+```
+进而所有依赖 TickStream 的模块(DumpDetector/PriceTracker/SignalEngine)都没数据。
+
+**根因**:`@triton-one/yellowstone-grpc` v1.4+(尤其 v5.x napi-rs 路径)要求 `stream.write()` 收到 **protobuf message 实例**,不是 plain JS object。
+- TCP 连接 OK、subscribe 调用不报错、stream.write 不报错
+- **但 server 端拒绝序列化** → 永远收不到 data → 静默失败
+- 这是该 SDK 已知的 breaking change,但 README 没说清楚
+
+**修复**:`TickStream._sendSubscribeRequest` 用 defensive 导入:
+```js
+const SubscribeRequest = yellowstoneGrpc.SubscribeRequest || null;
+// ...
+const request = SubscribeRequest
+  ? SubscribeRequest.create(requestPlain)  // 新版 SDK
+  : requestPlain;                            // 老版 fallback
+```
+
+向后兼容老版 SDK(导出不带 .create 时直接 plain object),适配新版(用 .create 包成 protobuf message)。
+
+---
 
 ### 1. Bug:reconcile 完成后 highWaterMark 没重置 → trailing 误杀
 

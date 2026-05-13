@@ -43,8 +43,60 @@ class AlertChecker {
       this._checkExecutorFailures();
       this._checkStuckPositions();
       this._checkParseErrorRate();
+      // v3.17.9: BUY 链上失败 / CU 接近上限 / reconcile watchdog 触发
+      this._checkBuyChainFailures();
     } catch (err) {
       this.monitor.recordError('AlertChecker', err);
+    }
+  }
+
+  /**
+   * v3.17.9: 关键的 BUY 链上失败监控
+   *
+   * 区分两种情况:
+   * 1. CU 接近上限(≥90% 利用率):告警 warn 级别 — 提示"还有余量但 BUY 即将开始爆"
+   * 2. 链上 BUY 失败(ProgramFailedToComplete):error 级别 — 已经在烧 fee 但没买到
+   * 3. reconcile watchdog 触发(60s 内 reconcile 没完成):critical — 通常是 RPC 问题
+   */
+  _checkBuyChainFailures() {
+    const cuNearLimit = this.monitor.getCounter('PositionManager.cuNearLimit') || 0;
+    const buyChainFail = this.monitor.getCounter('PositionManager.buyChainFail') || 0;
+    const reconcileWatchdog = this.monitor.getCounter('PositionManager.reconcileWatchdog') || 0;
+
+    // CU 接近上限 — 还能成功但下一笔可能爆
+    if (cuNearLimit > 0) {
+      this.monitor.fireAlert(
+        'executor.cu_near_limit',
+        'warn',
+        `${cuNearLimit} 笔 BUY CU 利用率 ≥90%,下一笔可能 BUY_CHAIN_FAILED。立刻调大 COMPUTE_UNIT_LIMIT (推荐 +30K)`,
+        { cuNearLimit },
+      );
+    } else {
+      this.monitor.clearAlert('executor.cu_near_limit');
+    }
+
+    // BUY 链上失败 — 已经烧 fee 但没买到 token
+    if (buyChainFail > 0) {
+      this.monitor.fireAlert(
+        'executor.buy_chain_failed',
+        'error',
+        `${buyChainFail} 笔 BUY ProgramFailedToComplete,fee 已烧但 token 没买到。立刻调大 COMPUTE_UNIT_LIMIT`,
+        { buyChainFail },
+      );
+    } else {
+      this.monitor.clearAlert('executor.buy_chain_failed');
+    }
+
+    // reconcile watchdog 触发 — 异常的 reconcile 未执行场景
+    if (reconcileWatchdog > 0) {
+      this.monitor.fireAlert(
+        'positions.reconcile_watchdog',
+        'critical',
+        `${reconcileWatchdog} 笔 position 60s 内 reconcile 未完成被 watchdog 强关。通常是 Helius RPC 异常,检查网络`,
+        { reconcileWatchdog },
+      );
+    } else {
+      this.monitor.clearAlert('positions.reconcile_watchdog');
     }
   }
 
